@@ -1,0 +1,14 @@
+Data/
+.DS_Store
+.venv/
+result/
+checkpoints/
+.vscode/
+dp_run01/
+CLAUDE.md
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.ipynb_checkpoints/
