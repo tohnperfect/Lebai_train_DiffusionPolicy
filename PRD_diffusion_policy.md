@@ -8,16 +8,16 @@ This document is intentionally specific. It captures concrete decisions, exact A
 
 ## 1. Project goal
 
-A three-step pipeline to train a Diffusion Policy on teleoperated demos from a **Lebai LM3** 6-DOF arm + parallel gripper and run it on the real robot.
+A four-step pipeline to train a Diffusion Policy on teleoperated demos from a **Lebai LM3** 6-DOF arm + parallel gripper and run it on the real robot.
 
 **Workflow (non-negotiable order):**
 
 1. **Local conversion** — Python script, reads raw collection logs in `./Data/`, writes a [LeRobot](https://github.com/huggingface/lerobot) dataset under `./result/`. Run on the developer's laptop.
 2. **Local verification** — separate Python script, opens the converted dataset in a fresh process, prints sanity stats. Required because of an async-writer race in lerobot ≥0.5 (see §10).
-3. **Colab training** — Jupyter notebook. Reads the dataset from a tarball on Drive, trains, writes checkpoints back to Drive. GPU runtime.
-4. **Local inference** — Python script. Loads a Drive checkpoint, talks to the live arm over LAN. Must run on a machine on the robot's network.
+3. **GPU training** — preferred: `train_local_gpu.py` on a Linux box with an NVIDIA GPU (data shipped over `rsync`). Fallback: `train_diffusion_colab.ipynb` on Colab with a Drive tarball (for users without a local GPU box).
+4. **Local inference** — Python script. Loads a checkpoint copied from the GPU box, talks to the live arm over LAN. Must run on a machine on the robot's network.
 
-Conversion and inference are **`.py` scripts only**. No notebooks for those. Notebooks are reserved for training.
+Conversion and inference are **`.py` scripts only**. The training notebook is the Colab fallback; the canonical training path is the headless script.
 
 ---
 
@@ -33,13 +33,16 @@ If the developer asks "should I use ACT?", point them at the ACT repo. This repo
 
 ```
 Lebai_train_DiffusionPolicy/
-├── CLAUDE.md                                  # Claude Code's project notes
+├── CLAUDE.md                                  # Claude Code's project notes (gitignored)
 ├── README.md                                  # User-facing docs
-├── .gitignore                                 # Data/, .venv/, result/, checkpoints/, act_run01/, .DS_Store, .vscode/
+├── .gitignore                                 # Data/, .venv/, result/, checkpoints/, dp_run01/, CLAUDE.md, etc.
 ├── Data/                                      # gitignored; user drops raw logs here
 ├── convert_local.py                           # Step 1 — local CLI converter
 ├── verify_local.py                            # Step 2 — local CLI verifier (separate process)
-├── train_diffusion_colab.ipynb                # Step 3 — Colab training notebook
+├── setup_gpu_env.sh                           # Step 3 — bootstrap .venv/ on the GPU box
+├── requirements_gpu.txt                       # Step 3 — pinned deps for GPU training
+├── train_local_gpu.py                         # Step 3 — local GPU training (preferred)
+├── train_diffusion_colab.ipynb                # Step 3 — Colab fallback
 ├── run_inference.py                           # Step 4 — local inference CLI
 └── recover_lerobot_dataset.py                 # Optional — for older dataset layouts; not strictly needed for lerobot ≥0.5
 ```
@@ -68,14 +71,39 @@ CSV columns include: `frame, color, wrist, jp0..jp5, tgt_jp0..tgt_jp5, claw_ampl
 
 ## 5. State and action conventions (LeRobot features)
 
-Same as the ACT repo:
-
 - **`observation.state`** = `(7,) float32` = `[jp0..jp5, claw_amplitude]` — current joints in rad, gripper amplitude in `[0, 100]`.
-- **`action`** = `(7,) float32` = `[tgt_jp0..tgt_jp5, next_claw_amplitude]` — commanded joint targets + **next-frame** gripper amplitude.
 
-The **next-frame gripper trick** compensates for the slow gripper actuator: the command issued at time `t` shows up in the actual amplitude around `t+1`, so the converter pulls `claw_amplitude` from the *next* row. If `tgt_jp*` is empty (some firmwares don't populate it in teaching mode), fall back to `next_row.jp*`.
+### Action representation
 
-`INCLUDE_GRIPPER = False` in the converter drops the 7th dim → both state and action become `(6,)`. All three stages must agree.
+The converter supports two modes via `ACTION_MODE`:
+
+- **`"relative"` (default)** — `action[:6] = (next_jp - jp) * ACTION_DELTA_SCALE`. Per-tick joint deltas in rad, multiplied by a constant (default `100.0`). Raw deltas at 10 Hz are ~`0.005–0.01` rad — too small for the network to fit quickly. Scaling brings target magnitudes to ~`0.5–1.0`, which trains much faster.
+- **`"absolute"`** — `action[:6] = tgt_jp[:6]`, with fallback to `next_row.jp*` if the firmware didn't populate `tgt_jp*`. Old convention from the ACT repo. Kept for compatibility.
+
+In both modes:
+- **`action[6] = next_row.claw_amplitude`** — gripper is **always** the absolute next-frame amplitude in `[0, 100]`, **never scaled**. The next-frame trick compensates for the gripper's slow actuator (command issued at `t` shows up in the actual amplitude around `t+1`).
+
+The scale is encoded in `REPO_ID` so different action representations can coexist on disk and so inference can refuse to run with a mismatched scale:
+
+```python
+if ACTION_MODE == "relative":
+    REPO_ID = f"local/lebai_duck_pick_delta_x{int(ACTION_DELTA_SCALE)}"
+else:
+    REPO_ID = "local/lebai_duck_pick"
+```
+
+All four stages (`convert_local.py`, `verify_local.py`, `train_local_gpu.py`, `run_inference.py`) and the Colab notebook must agree on `ACTION_MODE` and `ACTION_DELTA_SCALE`. `run_inference.py` has `--action-mode` and `--action-delta-scale` flags that default to relative / 100.
+
+Inference resolution (`run_inference.py:resolve_targets`):
+
+```python
+if action_mode == "relative":
+    target_joints[i] = state[i] + action[i] / action_delta_scale
+else:
+    target_joints[i] = action[i]
+```
+
+`INCLUDE_GRIPPER = False` in the converter drops the 7th dim → both state and action become `(6,)`. All stages must agree.
 
 Image features:
 - `observation.images.base` = `(480, 640, 3) uint8`
@@ -282,25 +310,55 @@ The script's docstring must explicitly say "run this in a fresh shell after `con
 
 ---
 
-## 10. Step 3 — `train_diffusion_colab.ipynb`
+## 10. Step 3 — GPU training
 
-Single Colab notebook. Cells in this order:
+Two paths, pick the one that fits the user's hardware.
+
+### 10a. `train_local_gpu.py` (preferred — local Linux GPU box)
+
+Headless training script. Run from the repo root after `setup_gpu_env.sh` has installed deps:
+
+```bash
+./setup_gpu_env.sh                                # creates .venv/, pins lerobot==0.5.1
+source .venv/bin/activate
+python train_local_gpu.py --smoke-test            # 200 steps / batch 4 / no saves — mandatory
+python train_local_gpu.py                         # full run
+python train_local_gpu.py --no-resume             # start fresh, ignore step_* checkpoints
+```
+
+CLI flags: `--repo-id`, `--checkpoint-dir`, `--num-steps`, `--batch-size`, `--num-workers`, `--lr`, `--log-every`, `--save-every`, `--smoke-test`, `--no-resume`.
+
+The smoke test is mandatory in the README — it catches env/data issues in 1–3 minutes before committing to a 50k-step run.
+
+The dataset reaches the GPU box via `rsync` (resumable, incremental, no 14 GB tarball on disk):
+
+```bash
+rsync -avh --progress \
+    ./result/local/lebai_duck_pick_delta_x100/ \
+    user@gpu:Lebai_train_DiffusionPolicy/result/local/lebai_duck_pick_delta_x100/
+```
+
+Resume from the latest `step_*` checkpoint is automatic. Fast-forward the LR scheduler from `start_step`.
+
+### 10b. `train_diffusion_colab.ipynb` (fallback — for users without a local GPU)
+
+Single Colab notebook, same logic. Cells in this order:
 
 1. **Intro markdown.** Pre-conditions: local conversion done, tarball uploaded, GPU runtime.
-2. **Install deps.** `!pip install -q lerobot matplotlib`. Pin a version: `lerobot==0.5.1`.
+2. **Install deps.** `!pip install -q 'lerobot==0.5.1' matplotlib`.
 3. **Mount Drive.** Use `force_remount=True` — Colab leaves stale state otherwise.
 4. **Paths cell.**
    - `DRIVE_ROOT = Path("/content/drive/MyDrive/Lebai_train_DiffusionPolicy")`.
    - `LEROBOT_CACHE = Path("/content/lerobot_cache")` — **local SSD, not Drive**.
    - `CHECKPOINT_DIR = DRIVE_ROOT / "checkpoints/dp_run01"` — Drive (small, sequential writes, fine for Drive).
-   - `DATASET_TAR = DRIVE_ROOT / "lebai_duck_pick.tar.gz"`.
+   - `DATASET_NAME = f"lebai_duck_pick_delta_x{int(ACTION_DELTA_SCALE)}"`; the tarball + extracted dir use this name.
+   - `os.environ["HF_LEROBOT_HOME"]` to the cache path. **Also** set `HF_DATASETS_CACHE` to a local-SSD path — huggingface_datasets makes a separate ~14 GB cache.
    - On first run: `subprocess.run(["tar", "-xzf", str(DATASET_TAR), "-C", str(LEROBOT_CACHE)], check=True)`.
-   - Set `os.environ["HF_LEROBOT_HOME"]` to the cache path.
 5. **Imports.** Define `make_policy_features(...)` helper here.
 6. **Dataset metadata + sanity-check viz** (image + state/action plots for episode 0). Use `ds.meta.episodes[0]["dataset_from_index"]` to slice.
 7. **Configure policy** with the §6 hyperparameters. Build `DiffusionConfig`, wrap features.
 8. **Resume cell.** Check `CHECKPOINT_DIR / "step_*"`, load latest if present, set `start_step` accordingly. Fast-forward the LR scheduler.
-9. **Train loop.** `range(start_step, NUM_STEPS)`. Unpack `loss, loss_dict = policy.forward(batch)`. Save checkpoints every `SAVE_EVERY`.
+9. **Train loop.** `range(start_step, NUM_STEPS)`. Unpack `loss, _ = policy.forward(batch)` (DP's second element is always None — §7.4). Save checkpoints every `SAVE_EVERY`.
 10. **Loss curve plot.**
 11. **Next-steps markdown.** Download `final/` to the robot machine and point `run_inference.py` at it.
 
@@ -350,29 +408,37 @@ Three lines per tick when `--verbose`:
 
 ```
   t=  1.0s  step=  10  loop=42ms
-    state : [ 1.574 -1.554  1.300 -1.318 -1.571  0.002]    gripper= 99.0
-    action: [ 1.575 -1.555  1.301 -1.318 -1.571  0.002]    gripper= 99.0 (SENT|rate-limited)
-    delta : [ 0.001 -0.001  0.001  0.000  0.000  0.000]
+    state    : [ 1.574 -1.554  1.300 -1.318 -1.571  0.002]    gripper= 99.0
+    delta    : [ 0.001 -0.001  0.001  0.000  0.000  0.000]
+    abs targ : [ 1.575 -1.555  1.301 -1.318 -1.571  0.002]    gripper= 99.0 (SENT|rate-limited)
 ```
 
-Without `--verbose`: one summary line per second.
+`state` is the current robot state. `delta` is the policy output (the scaled per-tick delta in relative mode, or the action directly in absolute mode). `abs targ` is what `resolve_targets` produced and what `movej` will receive — this is the line to sanity-check.
+
+Without `--verbose`: one summary line every 10 ticks.
 
 ---
 
-## 12. README must document the local-convert + Colab-train flow
+## 12. README must document the local-convert + local-GPU-train flow
 
-Headline section: **"Recommended: convert locally, train on Colab, infer on the robot machine."**
+Headline: **"Recommended: convert locally, rsync to a GPU box, train there, scp the checkpoint to the robot machine."**
 
 Include:
 
 1. Local convert: `python convert_local.py` then `python verify_local.py`.
-2. Tarball: `cd result && tar -czf lebai_duck_pick.tar.gz local/lebai_duck_pick`. Note the ~3.5 GB size for ~10 episodes / 9k frames.
-3. Upload to Drive at `MyDrive/Lebai_train_DiffusionPolicy/lebai_duck_pick.tar.gz`.
-4. Open notebook in Colab → set GPU runtime → run all cells.
-5. Download `checkpoints/dp_run01/final/` from Drive to the robot machine.
-6. Local inference: dry run, then `SAFETY_OK=1 ...`.
+2. `rsync -avh --progress ./result/local/lebai_duck_pick_delta_x100/ user@gpu:.../result/local/lebai_duck_pick_delta_x100/`.
+3. On the GPU box: `./setup_gpu_env.sh`, `python train_local_gpu.py --smoke-test` (mandatory), then `python train_local_gpu.py`.
+4. `scp -r user@gpu:.../checkpoints/dp_run01/final ./checkpoints/dp_run01/final` on the robot machine.
+5. Local inference: `python run_inference.py --dry-run`, then `SAFETY_OK=1 python run_inference.py --duration 30`.
 
-Include the **explicit safety checklist** in the inference section. Non-negotiable.
+Also document the Colab fallback (tarball → Drive upload → notebook) for users without a local GPU.
+
+Disk hygiene callouts:
+
+- HuggingFace `datasets` makes its own ~14 GB cache at `~/.cache/huggingface/datasets/` when training opens the dataset. Clear after a known-good run; on disk-constrained boxes set `HF_DATASETS_CACHE=/scratch/hf_cache` before launching.
+- Budget **~2×** dataset size in free disk during training.
+
+The safety checklist (§11) goes in the inference section. Non-negotiable.
 
 ---
 
@@ -386,26 +452,40 @@ result/
 checkpoints/
 .vscode/
 dp_run01/
+CLAUDE.md
 ```
 
 ---
 
 ## 14. Common pitfalls (DO NOT REPEAT — these are real, we hit each one)
 
-1. **Don't write the LeRobot dataset to Google Drive directly.** Thousands of small parquet shard writes corrupt files when Colab disconnects. Convert locally or to Colab SSD; transport via tarball.
+1. **Don't write the LeRobot dataset to Google Drive directly.** Thousands of small parquet shard writes corrupt files when Colab disconnects. Convert locally or to Colab SSD; transport via tarball or rsync.
 2. **Don't verify a dataset in the same Python process that wrote it.** Async meta-parquet writer can lag. `ArrowInvalid: Parquet magic bytes not found` is misleading — the file is fine seconds later in a fresh process.
-3. **Don't trust `astype(str)` on a pandas column with NaN.** `NaN → "nan"` (length 3), which `.str.len() > 0` returns True for. Use `.fillna("")` then check `!= ""` and `.str.lower() != "nan"`.
-4. **Don't pass dataset features directly to `cfg.input_features` / `cfg.output_features`.** They need `PolicyFeature` wrappers in lerobot ≥0.5.
+3. **Don't trust `astype(str)` on a pandas column with NaN.** `NaN → "nan"` (length 3), which `.str.len() > 0` returns True for. Use `.fillna("")` then check `!= ""` and `.str.lower() != "nan"`. The fix in `convert_local.py`:
+   ```python
+   wrist_strs = df["wrist"].fillna("").astype(str).str.strip()
+   all_have_wrist = ((wrist_strs != "") & (wrist_strs.str.lower() != "nan")).all()
+   ```
+4. **Don't pass dataset features directly to `cfg.input_features` / `cfg.output_features`.** They need `PolicyFeature` wrappers in lerobot ≥0.5. For DP, VISUAL shapes must be CHW, not HWC (see §7.6).
 5. **Don't expect `episode_data_index` on the dataset.** Use `ds.meta.episodes[i]["dataset_from_index"]`.
-6. **Don't unpack `policy.forward(batch)` as a dict.** It returns `(loss, loss_dict)` tuple in lerobot ≥0.5.
-7. **Don't run inference on Colab.** No LAN access to robot/camera. Inference is **local only**.
-8. **Don't run inference without a dry-run first.** Always print the predicted action and verify `delta = action - state` is small (~`±0.05` rad per joint) before allowing motion.
-9. **Don't re-add `wait_move()` to the control loop.** Blocks the tick budget.
-10. **Don't run multiple `set_claw()` calls per tick.** Gripper is a slow actuator; rate-limit changes via `GRIPPER_THRESHOLD`.
-11. **Don't change `INCLUDE_GRIPPER` / `INCLUDE_WRIST` / `FPS` in the middle of a project.** Those bake into the dataset features; changing them mid-flight breaks resume and produces shape mismatches downstream.
-12. **Don't skip `policy.reset()` between inference runs.** Stale temporal queue → first chunk_size actions are wrong.
-13. **Don't pip-install `lerobot` into a conda env that has `opencv-python-headless` installed via conda.** Pip can't uninstall conda packages. Either `conda uninstall opencv-python-headless` first, or use a clean venv.
-14. **Don't assume a free Colab session can run 100k steps without disconnecting.** Implement resume from the latest `step_*` checkpoint. Test the resume path before committing to the long run.
+6. **Don't unpack `policy.forward(batch)` as a dict.** It returns `(loss, loss_dict)` tuple in lerobot ≥0.5. For DP the second element is always `None` — `loss, _ = policy.forward(batch)`.
+7. **Don't use raw per-tick joint deltas at 10 Hz as the action target.** Magnitudes are ~`±0.005-0.01` rad — too small to train quickly. Multiply by `ACTION_DELTA_SCALE = 100.0` (see §5) and encode the scale in `REPO_ID`. Inference must divide by the same constant.
+8. **Don't use `image_writer_threads=4, image_writer_processes=2`** (the lerobot defaults). On 8 GB M1 the writer queue OOMs and you get random `FileNotFoundError: ... frame-NNN.png` mid-conversion when `save_episode` tries to read images back. Use `threads=2, processes=0`. **Don't go all the way to `threads=0, processes=0`** — that disables image writing entirely in lerobot 0.5.1 (only the first episode's directory is created, rest silently dropped).
+9. **Don't only drain the image writer at episode boundaries.** The queue can still grow within a long episode. Drain every ~200 frames inside the per-frame loop, and drain once more before each `save_episode()`:
+   ```python
+   if iw is not None and (i + 1) % DRAIN_EVERY == 0:
+       iw.wait_until_done()
+   ```
+10. **Don't run inference on Colab.** No LAN access to robot/camera. Inference is **local only**.
+11. **Don't run inference without a dry-run first.** Always print the predicted action and verify `abs targ - state` is small (`|max|` ≲ 0.05 rad per joint) before allowing motion.
+12. **Don't run inference with a mismatched `--action-delta-scale`.** A dataset converted with scale 100 trained → inference with scale 1 produces targets 100× too far per tick. Always confirm the dry-run `abs targ` is sane.
+13. **Don't re-add `wait_move()` to the control loop.** Blocks the tick budget.
+14. **Don't run multiple `set_claw()` calls per tick.** Gripper is a slow actuator; rate-limit changes via `GRIPPER_THRESHOLD`.
+15. **Don't change `INCLUDE_GRIPPER` / `INCLUDE_WRIST` / `FPS` / `ACTION_MODE` / `ACTION_DELTA_SCALE` mid-project.** Those bake into the dataset features and/or `REPO_ID`; changing them mid-flight breaks resume and produces shape or magnitude mismatches downstream.
+16. **Don't skip `policy.reset()` between inference runs.** Stale internal action queue → first ~`n_action_steps` actions are wrong.
+17. **Don't pip-install `lerobot` into a conda env that has `opencv-python-headless` installed via conda.** Pip can't uninstall conda packages. Either `conda uninstall opencv-python-headless` first, or use a clean venv.
+18. **Don't assume a free Colab session can run 100k steps without disconnecting.** Implement resume from the latest `step_*` checkpoint. Test the resume path before committing to the long run.
+19. **Don't leave the HuggingFace datasets cache alone after training runs.** It silently doubles disk usage at `~/.cache/huggingface/datasets/` (a separate ~14 GB copy per training run is normal). Clear it after a known-good run, or set `HF_DATASETS_CACHE` to a scratch path before launching training on disk-constrained boxes.
 
 ---
 
@@ -431,15 +511,21 @@ These come from `grasp_to_the_bowl.py` (Lebai's reference scripted-control examp
 
 ## 16. Acceptance criteria
 
-The new repo is done when:
+The repo is done when:
 
-- [ ] `python convert_local.py` produces `result/local/lebai_duck_pick/` containing data + meta parquets.
-- [ ] `python verify_local.py` opens that dataset cleanly and prints 10 episodes / 9246 frames for the bundled data.
-- [ ] `tar -czf result/lebai_duck_pick.tar.gz -C result local/lebai_duck_pick` produces a ~3.5 GB tarball.
-- [ ] `train_diffusion_colab.ipynb` runs end-to-end on a fresh Colab GPU runtime: extracts the tarball, builds the policy, runs at least 200 smoke-test steps with decreasing loss, saves a `final/` checkpoint to Drive.
-- [ ] `python run_inference.py --dry-run` connects to the camera + robot and prints sensible state/action/delta values.
-- [ ] `SAFETY_OK=1 python run_inference.py --duration 30` runs the control loop at 10 Hz with `loop=` under 100 ms.
-- [ ] README documents the full flow.
+- [ ] `python convert_local.py` produces `result/local/lebai_duck_pick_delta_x100/` containing data + meta parquets. Episode/frame counts match what's in `Data/` (e.g. 30 episodes / 27,503 frames for the bundled 30 logs).
+- [ ] **Spot-check action magnitudes.** `ds[600]["action"][:6]` shows values with `|max|` around `0.5–1.0` (not `~0.05`). Confirms `ACTION_DELTA_SCALE` is applied. `verify_local.py` prints this automatically.
+- [ ] `python verify_local.py` opens the dataset cleanly in a fresh process.
+- [ ] **Idempotent re-convert.** Running `python convert_local.py` twice in a row succeeds; the second run cleanly wipes the existing dataset and rebuilds without `OSError: Directory not empty` (image-writer cleanup is working).
+- [ ] `rsync -avh --progress ./result/local/lebai_duck_pick_delta_x100/ user@gpu:.../result/local/lebai_duck_pick_delta_x100/` transfers cleanly and is resumable.
+- [ ] `./setup_gpu_env.sh` on the GPU box creates `.venv/` and installs `lerobot==0.5.1`.
+- [ ] `python train_local_gpu.py --smoke-test` completes 200 steps with mean loss in the last 10 steps lower than mean loss in the first 10 steps.
+- [ ] `python train_local_gpu.py` runs end-to-end (full default 100k steps), resuming from `step_*` if interrupted, saving `final/` at the end.
+- [ ] `train_diffusion_colab.ipynb` runs end-to-end on a fresh Colab GPU runtime: extracts the tarball, builds the policy, runs at least 200 smoke-test steps with decreasing loss, saves a `final/` checkpoint to Drive. (Fallback path — only validated as needed.)
+- [ ] `python run_inference.py --dry-run` connects to the camera + robot and prints sensible `state` / `delta` / `abs targ` values. `|abs targ - state| ≲ 0.05 rad` per joint.
+- [ ] `python run_inference.py --action-delta-scale 100 --dry-run` matches the converter default. **Run with `--action-delta-scale 1` and confirm `abs targ` is wildly off** — proves the scale is wired through end-to-end.
+- [ ] `SAFETY_OK=1 python run_inference.py --duration 30` runs the control loop at 10 Hz with `loop=` under 100 ms (the bimodal forward-pass vs. queue-pop ticks both stay under the budget).
+- [ ] README documents the local-GPU flow as the recommended path and the Colab flow as the fallback. Disk-hygiene notes (HF datasets cache duplication) included.
 
 ---
 

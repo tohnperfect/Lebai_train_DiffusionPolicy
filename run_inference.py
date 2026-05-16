@@ -14,23 +14,27 @@ Run from a machine on the same LAN as the robot and camera service.
     # Try a different checkpoint:
     python run_inference.py --checkpoint ./checkpoints/dp_run01/step_080000 --dry-run
 
+Action mode (must match the converter — PRD §1 of the v2 update):
+  - 'relative' (default): the policy outputs a scaled per-tick joint delta.
+        target[i] = state[i] + action[i] / action_delta_scale
+    Gripper (dim 6) is absolute amplitude in [0, 100], never scaled.
+  - 'absolute': the policy output is the joint target directly.
+        target[i] = action[i]
+
+A mismatched --action-delta-scale produces wildly wrong targets — verify the
+dry-run delta + abs targ match the dataset's REPO_ID conventions before allowing motion.
+
 DP-specific notes vs. ACT (PRD §11):
   - `policy.select_action(obs)` returns one action per call, but only every
     `n_action_steps`-th call does a real forward pass. The policy's internal
     queue handles chunking — do NOT write your own chunking.
-  - DP at inference uses DDIM with ~10 denoising steps (set during training).
-    The forward pass that re-fills the queue is the expensive tick; the other
-    7/8 ticks just pop from the queue. Per-tick `loop=Xms` will be bimodal.
-  - `policy.reset()` clears the internal action queue. Skipping it makes the
-    first ~n_action_steps actions reuse stale history.
+  - `policy.reset()` clears the internal action queue.
 
 SAFETY: before each non-dry run, confirm
   1. Workspace is clear, no one within arm sweep range.
   2. E-stop is within reach.
   3. Pendant velocity factor is low.
-  4. The arm starts in a pose similar to one of the training episodes' first
-     frames — the policy was trained on those starts and will not generalize
-     to wildly different ones.
+  4. The arm starts in a pose similar to one of the training episodes' first frames.
 
 The script will not move the arm without the SAFETY_OK environment variable set:
 
@@ -62,9 +66,11 @@ except ImportError:
 # ---------------------------------------------------------------------------
 # Defaults — change here, or override on the command line.
 
-DEFAULT_CHECKPOINT = "./checkpoints/dp_run01/final"
-DEFAULT_ROBOT_IP   = "192.168.31.254"
-DEFAULT_CAMERA_URL = "http://192.168.31.192:8000"
+DEFAULT_CHECKPOINT          = "./checkpoints/dp_run01/final"
+DEFAULT_ROBOT_IP            = "192.168.31.254"
+DEFAULT_CAMERA_URL          = "http://192.168.31.192:8000"
+DEFAULT_ACTION_MODE         = "relative"
+DEFAULT_ACTION_DELTA_SCALE  = 100.0
 
 # Control loop tick + safety
 DEFAULT_DURATION_S = 30.0
@@ -152,34 +158,52 @@ def build_observation(policy, cam, lebai, base_cid, wrist_cid, expected_keys, de
     return obs
 
 
+def resolve_targets(state_np, action_np, action_mode, action_delta_scale):
+    """Convert the policy's raw output into absolute joint targets + gripper amp.
+
+    Relative mode: action[:6] is a per-tick scaled joint delta in rad. Undo
+    the scale and add to current state.
+    Absolute mode: action[:6] is the joint target itself.
+
+    Gripper (dim 6) is always the absolute next-frame amplitude in [0, 100].
+
+    Returns (target_joints: list[float] of length 6, gripper_amp: float | None).
+    """
+    if action_mode == "relative":
+        target_joints = [
+            float(state_np[i] + action_np[i] / action_delta_scale)
+            for i in range(6)
+        ]
+    else:  # absolute
+        target_joints = [float(action_np[i]) for i in range(6)]
+
+    gripper_amp = None
+    if len(action_np) >= 7:
+        gripper_amp = float(np.clip(action_np[6], 0.0, 100.0))
+    return target_joints, gripper_amp
+
+
 _last_gripper_sent = None
 
-def send_action(action_np, lebai):
-    """First 6 dims = joint targets (rad). Last dim (if 7) = gripper amplitude.
-
-    Returns (gripper_amp, gripper_sent_flag) so the caller can report whether
-    the gripper command was sent or rate-limited.
-    """
+def send_targets(target_joints, gripper_amp, lebai):
+    """Issue movej and (rate-limited) set_claw. Returns gripper_sent flag."""
     global _last_gripper_sent
 
-    target_joints = [float(x) for x in action_np[:6]]
     lebai.movej(
-        target_joints,
+        list(target_joints),
         JOINT_ACC_LIMIT, JOINT_VEL_LIMIT,
         0,                   # 't' arg, 0 means "use a/v limits"
         BLEND_RADIUS,
     )
 
-    gripper_amp = None
     gripper_sent = False
-    if len(action_np) >= 7:
-        gripper_amp = float(np.clip(action_np[6], 0.0, 100.0))
+    if gripper_amp is not None:
         if (_last_gripper_sent is None
                 or abs(gripper_amp - _last_gripper_sent) > GRIPPER_THRESHOLD):
             lebai.set_claw(GRIPPER_FORCE, gripper_amp)
             _last_gripper_sent = gripper_amp
             gripper_sent = True
-    return gripper_amp, gripper_sent
+    return gripper_sent
 
 
 # ---------------------------------------------------------------------------
@@ -195,11 +219,34 @@ def parse_args():
                    help=f"Camera service URL (default: {DEFAULT_CAMERA_URL})")
     p.add_argument("--duration", type=float, default=DEFAULT_DURATION_S,
                    help=f"Hard time limit on the control loop in seconds (default: {DEFAULT_DURATION_S})")
+    p.add_argument("--action-mode", choices=["relative", "absolute"], default=DEFAULT_ACTION_MODE,
+                   help=f"How to interpret the policy output (default: {DEFAULT_ACTION_MODE}). "
+                        f"MUST match the converter's ACTION_MODE — mismatch produces wildly wrong targets.")
+    p.add_argument("--action-delta-scale", type=float, default=DEFAULT_ACTION_DELTA_SCALE,
+                   help=f"Inverse scale for relative-mode actions (default: {DEFAULT_ACTION_DELTA_SCALE}). "
+                        f"Ignored in absolute mode. Must match the converter's ACTION_DELTA_SCALE.")
     p.add_argument("--dry-run", action="store_true",
                    help="Predict one action and print it, but do NOT send to the robot.")
     p.add_argument("-v", "--verbose", action="store_true",
-                   help="Print current state, predicted action, and delta every tick.")
+                   help="Print state, predicted delta, and resolved absolute target every tick.")
     return p.parse_args()
+
+
+def print_dry_run(cur_state, action_np, target_joints, gripper_amp, action_mode, action_delta_scale):
+    print("\n=== Dry-run prediction ===")
+    print(f"  action_mode={action_mode}  scale={action_delta_scale if action_mode == 'relative' else 'n/a'}")
+    print(f"  current state : {np.round(cur_state[:6], 3)}    "
+          f"gripper={cur_state[6]:5.1f}" if len(cur_state) >= 7
+          else f"  current state : {np.round(cur_state[:6], 3)}")
+    print(f"  policy delta  : {np.round(action_np[:6], 4)}    "
+          f"gripper={action_np[6]:5.1f}" if len(action_np) >= 7
+          else f"  policy delta  : {np.round(action_np[:6], 4)}")
+    print(f"  abs target    : {np.round(target_joints, 3)}    "
+          f"gripper={gripper_amp:5.1f}" if gripper_amp is not None
+          else f"  abs target    : {np.round(target_joints, 3)}")
+    abs_delta_rad = np.array(target_joints) - cur_state[:6]
+    print(f"  joint move    : {np.round(abs_delta_rad, 4)}   "
+          f"(|max|={np.max(np.abs(abs_delta_rad)):.4f} rad)")
 
 
 def main():
@@ -211,6 +258,8 @@ def main():
     # 1. Load policy
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Loading {args.checkpoint}  (device: {device})")
+    print(f"  action_mode={args.action_mode}  "
+          f"scale={args.action_delta_scale if args.action_mode == 'relative' else 'n/a'}")
     policy = DiffusionPolicy.from_pretrained(args.checkpoint)
     policy.to(device).eval()
     print(f"  horizon={policy.config.horizon}  "
@@ -245,14 +294,12 @@ def main():
         with torch.inference_mode():
             action = policy.select_action(obs)
         action_np = action[0].cpu().numpy()
-
         cur_state = obs["observation.state"][0].cpu().numpy()
-        print("\n=== Dry-run prediction ===")
-        print(f"  current state: {np.round(cur_state, 3)}")
-        print(f"  predicted action: {np.round(action_np, 3)}")
-        print(f"  delta (action - state): {np.round(action_np - cur_state, 4)}")
-        if len(action_np) >= 7:
-            print(f"  gripper amplitude: {action_np[6]:.1f}")
+        target_joints, gripper_amp = resolve_targets(
+            cur_state, action_np, args.action_mode, args.action_delta_scale
+        )
+        print_dry_run(cur_state, action_np, target_joints, gripper_amp,
+                      args.action_mode, args.action_delta_scale)
 
         if args.dry_run:
             print("\n--dry-run set, exiting without moving the robot.")
@@ -303,28 +350,29 @@ def main():
             action_np = action[0].cpu().numpy()
             state_np = obs["observation.state"][0].cpu().numpy()
 
-            gripper_amp, gripper_sent = send_action(action_np, lebai)
+            target_joints, gripper_amp = resolve_targets(
+                state_np, action_np, args.action_mode, args.action_delta_scale
+            )
+            gripper_sent = send_targets(target_joints, gripper_amp, lebai)
 
             step += 1
             log_now = args.verbose or (step % 10 == 0)
             if log_now:
                 loop_ms = (time.time() - loop_t) * 1000
                 if args.verbose:
-                    delta = action_np - state_np
                     print(f"  t={loop_t - t_start:5.1f}s  step={step:4d}  loop={loop_ms:.0f}ms")
-                    print(f"    state : {np.round(state_np[:6], 3)}    "
-                          f"gripper={state_np[6]:5.1f}" if len(state_np) >= 7
-                          else f"    state : {np.round(state_np[:6], 3)}")
-                    print(f"    action: {np.round(action_np[:6], 3)}    "
-                          f"gripper={gripper_amp:5.1f} {'(SENT)' if gripper_sent else '(rate-limited)'}"
-                          if gripper_amp is not None else
-                          f"    action: {np.round(action_np[:6], 3)}")
-                    print(f"    delta : {np.round(delta[:6], 4)}")
+                    s_tail = f"    gripper={state_np[6]:5.1f}" if len(state_np) >= 7 else ""
+                    print(f"    state    : {np.round(state_np[:6], 3)}{s_tail}")
+                    print(f"    delta    : {np.round(action_np[:6], 4)}")
+                    g_tail = ""
+                    if gripper_amp is not None:
+                        g_tail = f"    gripper={gripper_amp:5.1f} {'(SENT)' if gripper_sent else '(rate-limited)'}"
+                    print(f"    abs targ : {np.round(target_joints, 3)}{g_tail}")
                 else:
                     msg = (f"  t={loop_t - t_start:5.1f}s  step={step:4d}  "
-                           f"loop={loop_ms:.0f}ms  j={np.round(action_np[:6], 2)}")
-                    if len(action_np) >= 7:
-                        msg += f"  g={action_np[6]:.0f}"
+                           f"loop={loop_ms:.0f}ms  abs={np.round(target_joints, 2)}")
+                    if gripper_amp is not None:
+                        msg += f"  g={gripper_amp:.0f}"
                     print(msg)
 
             next_tick += PERIOD_S

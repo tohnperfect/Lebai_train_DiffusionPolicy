@@ -1,0 +1,6 @@
+# Pinned deps for the local-GPU training path.
+# Used by setup_gpu_env.sh and train_local_gpu.py.
+# Do NOT bump lerobot — 0.5.x APIs are load-bearing (see PRD §7).
+
+lerobot==0.5.1
+matplotlib
