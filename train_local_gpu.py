@@ -38,11 +38,18 @@ REPO_ROOT = Path(__file__).resolve().parent
 DEFAULT_RESULT_ROOT = REPO_ROOT / "result"
 os.environ.setdefault("HF_LEROBOT_HOME", str(DEFAULT_RESULT_ROOT))
 
-# Action mode + scale baked into the default REPO_ID; must match convert_local.py.
+# Action mode + scales baked into the default REPO_ID; must match convert_local.py.
 DEFAULT_ACTION_MODE        = "relative"
 DEFAULT_ACTION_DELTA_SCALE = 100.0
+DEFAULT_GRIPPER_SCALE      = 0.01
 if DEFAULT_ACTION_MODE == "relative":
-    DEFAULT_REPO_ID = f"local/lebai_duck_pick_delta_x{int(DEFAULT_ACTION_DELTA_SCALE)}"
+    if DEFAULT_GRIPPER_SCALE == 1.0:
+        DEFAULT_REPO_ID = f"local/lebai_duck_pick_delta_x{int(DEFAULT_ACTION_DELTA_SCALE)}"
+    else:
+        DEFAULT_REPO_ID = (
+            f"local/lebai_duck_pick_delta_x{int(DEFAULT_ACTION_DELTA_SCALE)}"
+            f"_g{int(round(1.0 / DEFAULT_GRIPPER_SCALE))}"
+        )
 else:
     DEFAULT_REPO_ID = "local/lebai_duck_pick"
 

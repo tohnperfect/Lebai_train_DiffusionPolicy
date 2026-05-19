@@ -14,18 +14,28 @@ of conversion, and PRD §10.)
 
 Action representation
 ---------------------
-By default the action is a **scaled per-tick joint delta** (PRD §5, §14):
+By default the action is a **scaled per-tick joint delta** + **scaled gripper amplitude** (PRD §5, §14):
 
-    action[:6] = (next_jp - jp) * ACTION_DELTA_SCALE       # rad, scaled
-    action[6]  =  next_claw_amplitude                      # 0-100, NOT scaled
+    action[:6] = (next_jp - jp) * ACTION_DELTA_SCALE       # rad, scaled (default 100x)
+    action[6]  =  next_claw_amplitude * GRIPPER_SCALE      # 0-100 -> 0-1 (default 0.01x)
 
-The raw deltas at 10 Hz are ~0.005-0.01 rad — too small for the network to fit
-quickly. Multiplying by 100 brings target magnitudes to ~0.5-1.0, which trains
-much faster. The scale is encoded in REPO_ID so different scales can coexist
-on disk (and so inference can refuse to run with a mismatched scale).
+The raw joint deltas at 10 Hz are ~0.005-0.01 rad — too small for the network
+to fit quickly. Multiplying by 100 brings target magnitudes to ~0.5-1.0.
+
+The raw gripper amplitude is on a completely different scale ([0, 100], typical
+mean ~80) than the scaled joint deltas (~±1). DP's per-dim normalization can
+miscalibrate when one dim is two orders of magnitude larger than the others —
+in practice this presents as the policy outputting near-zero gripper amplitudes
+at inference (see PRD §14 pitfall on gripper collapse). Multiplying the gripper
+by 0.01 puts it in roughly the same range as the scaled joint deltas.
+
+Both scales are encoded in REPO_ID so different settings can coexist on disk
+(and inference refuses to run with a mismatched scale). Inference undoes both
+in `resolve_targets`.
 
 Set ACTION_MODE = "absolute" to fall back to commanding `tgt_jp*` directly
-(the old convention, kept for compatibility).
+(the old convention, kept for compatibility). Absolute mode does NOT apply
+GRIPPER_SCALE — the gripper stays in [0, 100].
 """
 
 import os
@@ -56,7 +66,8 @@ except ImportError:
 
 RUN_NUMBER = None                       # int to pick one log<NNNN>, None to merge all
 ACTION_MODE = "relative"                # "relative" (scaled delta) or "absolute"
-ACTION_DELTA_SCALE = 100.0              # only used when ACTION_MODE == "relative"
+ACTION_DELTA_SCALE = 100.0              # joint-delta multiplier; only used when ACTION_MODE == "relative"
+GRIPPER_SCALE = 0.01                    # gripper-amplitude multiplier; ignored in absolute mode
 INCLUDE_WRIST = True                    # auto-disabled if no wrist data is present
 INCLUDE_GRIPPER = True
 FPS = 10
@@ -72,7 +83,13 @@ DRAIN_EVERY          = 200              # periodic queue drain inside the per-fr
 
 
 if ACTION_MODE == "relative":
-    REPO_ID = f"local/lebai_duck_pick_delta_x{int(ACTION_DELTA_SCALE)}"
+    # The "g100" suffix is the *divisor* (1/GRIPPER_SCALE) — clearer to read
+    # than the literal fractional multiplier. Joints x100, gripper /100.
+    if not INCLUDE_GRIPPER or GRIPPER_SCALE == 1.0:
+        REPO_ID = f"local/lebai_duck_pick_delta_x{int(ACTION_DELTA_SCALE)}"
+    else:
+        REPO_ID = (f"local/lebai_duck_pick_delta_x{int(ACTION_DELTA_SCALE)}"
+                   f"_g{int(round(1.0 / GRIPPER_SCALE))}")
 elif ACTION_MODE == "absolute":
     REPO_ID = "local/lebai_duck_pick"
 else:
@@ -94,12 +111,14 @@ def build_action(row, next_row):
 
     Relative mode (default):
         joints[i] = (next_jp[i] - jp[i]) * ACTION_DELTA_SCALE
+        gripper   = next_claw_amplitude * GRIPPER_SCALE
     Absolute mode:
         joints[i] = tgt_jp[i], falling back to next_jp[i] if tgt_jp is NaN
-                   (some firmwares don't populate tgt_jp in teaching mode).
+                    (some firmwares don't populate tgt_jp in teaching mode).
+        gripper   = next_claw_amplitude  (UNSCALED in absolute mode)
 
-    Gripper is **always** the next-frame absolute amplitude, never scaled.
-    The next-frame trick (PRD §5) compensates for the gripper's slow actuator.
+    The next-frame trick (PRD §5) compensates for the gripper's slow actuator —
+    pull `claw_amplitude` from `next_row`, not the current row.
     """
     if ACTION_MODE == "relative":
         joints = [
@@ -114,7 +133,10 @@ def build_action(row, next_row):
             joints = [float(v) for v in tgt]
     if INCLUDE_GRIPPER:
         amp = next_row.get("claw_amplitude", row.get("claw_amplitude", 0.0))
-        joints.append(float(amp) if pd.notna(amp) else 0.0)
+        amp = float(amp) if pd.notna(amp) else 0.0
+        if ACTION_MODE == "relative":
+            amp = amp * GRIPPER_SCALE
+        joints.append(amp)
     return np.array(joints, dtype=np.float32)
 
 
@@ -200,7 +222,11 @@ def main():
     )
     iw = get_image_writer(dataset)
     print(f"Created empty dataset at {out_path}")
-    print(f"  action_mode={ACTION_MODE}  scale={ACTION_DELTA_SCALE if ACTION_MODE == 'relative' else 'n/a'}")
+    if ACTION_MODE == "relative":
+        print(f"  action_mode=relative  joint_scale={ACTION_DELTA_SCALE}  "
+              f"gripper_scale={GRIPPER_SCALE} (gripper /= {int(round(1.0 / GRIPPER_SCALE))} on output)")
+    else:
+        print(f"  action_mode=absolute  scales=n/a")
     print(f"  state_dim={state_dim}  action_dim={action_dim}  wrist={has_wrist_data}")
     print(f"  image_writer: threads={IMG_WRITER_THREADS} processes={IMG_WRITER_PROCESSES} "
           f"present={'yes' if iw is not None else 'no'}")

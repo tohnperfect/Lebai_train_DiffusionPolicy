@@ -62,9 +62,10 @@ def parse_args():
                    help="Path to a trained DiffusionPolicy checkpoint directory.")
     p.add_argument("--dataset-path", type=Path, default=Path("./result"),
                    help="HF_LEROBOT_HOME root. Default: ./result")
-    p.add_argument("--repo-id", default="local/lebai_duck_pick_delta_x100",
+    p.add_argument("--repo-id", default="local/lebai_duck_pick_delta_x100_g100",
                    help="Dataset repo-id under --dataset-path. "
-                        "Default: local/lebai_duck_pick_delta_x100 (relative-mode, scale 100).")
+                        "Default: local/lebai_duck_pick_delta_x100_g100 "
+                        "(relative mode, joint scale 100, gripper scale 0.01).")
     p.add_argument("--mode", choices=["forward", "rollout"], default="forward",
                    help="forward: random-frame eval (default). rollout: one full episode.")
     p.add_argument("--n-frames", type=int, default=50,

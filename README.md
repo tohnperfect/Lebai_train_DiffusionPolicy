@@ -22,7 +22,7 @@ pip install 'lerobot==0.5.1' pandas opencv-python tqdm
 python convert_local.py
 ```
 
-Writes a LeRobot dataset to `./result/local/lebai_duck_pick_delta_x100/`. The repo-id suffix `_delta_x100` encodes the **action representation**: scaled per-tick joint deltas with `ACTION_DELTA_SCALE = 100`. This is the default; see [convert_local.py](convert_local.py) to switch to absolute targets if needed. All four stages must agree on the action mode and scale.
+Writes a LeRobot dataset to `./result/local/lebai_duck_pick_delta_x100_g100/`. The repo-id encodes the **action representation**: `_delta_x100` = joint deltas scaled by `ACTION_DELTA_SCALE = 100`; `_g100` = gripper amplitude divided by 100 (i.e. `GRIPPER_SCALE = 0.01`, so the gripper lands in `[0, 1]` instead of `[0, 100]` — fixes a real collapse-to-zero failure we hit). See [convert_local.py](convert_local.py) to switch to absolute targets if needed. All four stages must agree on the action mode and scales.
 
 `lerobot==0.5.1` is pinned — newer versions move APIs. See [PRD §7](PRD_diffusion_policy.md).
 
@@ -45,8 +45,8 @@ If you have a Linux box with an NVIDIA GPU, `rsync` the dataset over and train l
 ```bash
 # from this repo on your laptop
 rsync -avh --progress \
-    ./result/local/lebai_duck_pick_delta_x100/ \
-    user@gpu:Lebai_train_DiffusionPolicy/result/local/lebai_duck_pick_delta_x100/
+    ./result/local/lebai_duck_pick_delta_x100_g100/ \
+    user@gpu:Lebai_train_DiffusionPolicy/result/local/lebai_duck_pick_delta_x100_g100/
 
 # on the GPU box
 cd Lebai_train_DiffusionPolicy
@@ -71,7 +71,7 @@ For users without a local GPU. See [train_diffusion_colab.ipynb](train_diffusion
 Tarball the dataset, upload to `MyDrive/Lebai_train_DiffusionPolicy/`, open the notebook in Colab with a GPU runtime, run all cells:
 
 ```bash
-cd result && tar -czf lebai_duck_pick_delta_x100.tar.gz local/lebai_duck_pick_delta_x100
+cd result && tar -czf lebai_duck_pick_delta_x100_g100.tar.gz local/lebai_duck_pick_delta_x100_g100
 ```
 
 #### Disk hygiene during training

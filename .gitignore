@@ -1,7 +1,7 @@
-Data/
+Data
 .DS_Store
 .venv/
-result/
+result
 checkpoints/
 .vscode/
 dp_run01/

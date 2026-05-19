@@ -15,14 +15,16 @@ Run from a machine on the same LAN as the robot and camera service.
     python run_inference.py --checkpoint ./checkpoints/dp_run01/step_080000 --dry-run
 
 Action mode (must match the converter — PRD §1 of the v2 update):
-  - 'relative' (default): the policy outputs a scaled per-tick joint delta.
-        target[i] = state[i] + action[i] / action_delta_scale
-    Gripper (dim 6) is absolute amplitude in [0, 100], never scaled.
-  - 'absolute': the policy output is the joint target directly.
-        target[i] = action[i]
+  - 'relative' (default): the policy outputs scaled joint deltas + scaled gripper.
+        target[i]   = state[i] + action[i] / action_delta_scale       (i in 0..5)
+        gripper_amp = action[6] / gripper_scale                       (clipped to [0,100])
+  - 'absolute': the policy output is the joint target directly; gripper is unscaled.
+        target[i]   = action[i]
+        gripper_amp = action[6]
 
-A mismatched --action-delta-scale produces wildly wrong targets — verify the
-dry-run delta + abs targ match the dataset's REPO_ID conventions before allowing motion.
+A mismatched --action-delta-scale or --gripper-scale produces wildly wrong
+targets — verify the dry-run delta + abs targ match the dataset's REPO_ID
+conventions before allowing motion.
 
 DP-specific notes vs. ACT (PRD §11):
   - `policy.select_action(obs)` returns one action per call, but only every
@@ -71,6 +73,7 @@ DEFAULT_ROBOT_IP            = "192.168.31.254"
 DEFAULT_CAMERA_URL          = "http://192.168.31.192:8000"
 DEFAULT_ACTION_MODE         = "relative"
 DEFAULT_ACTION_DELTA_SCALE  = 100.0
+DEFAULT_GRIPPER_SCALE       = 0.01     # 0 means "no gripper scaling" (absolute mode)
 
 # Control loop tick + safety
 DEFAULT_DURATION_S = 30.0
@@ -158,14 +161,15 @@ def build_observation(policy, cam, lebai, base_cid, wrist_cid, expected_keys, de
     return obs
 
 
-def resolve_targets(state_np, action_np, action_mode, action_delta_scale):
+def resolve_targets(state_np, action_np, action_mode, action_delta_scale, gripper_scale):
     """Convert the policy's raw output into absolute joint targets + gripper amp.
 
-    Relative mode: action[:6] is a per-tick scaled joint delta in rad. Undo
-    the scale and add to current state.
-    Absolute mode: action[:6] is the joint target itself.
-
-    Gripper (dim 6) is always the absolute next-frame amplitude in [0, 100].
+    Relative mode:
+        target[i]   = state[i] + action[i] / action_delta_scale     (joints)
+        gripper_amp = action[6] / gripper_scale  (then clipped to [0, 100])
+    Absolute mode:
+        target[i]   = action[i]
+        gripper_amp = action[6]  (assumed already in [0, 100])
 
     Returns (target_joints: list[float] of length 6, gripper_amp: float | None).
     """
@@ -179,7 +183,10 @@ def resolve_targets(state_np, action_np, action_mode, action_delta_scale):
 
     gripper_amp = None
     if len(action_np) >= 7:
-        gripper_amp = float(np.clip(action_np[6], 0.0, 100.0))
+        raw = float(action_np[6])
+        if action_mode == "relative" and gripper_scale and gripper_scale != 0.0:
+            raw = raw / gripper_scale
+        gripper_amp = float(np.clip(raw, 0.0, 100.0))
     return target_joints, gripper_amp
 
 
@@ -223,8 +230,13 @@ def parse_args():
                    help=f"How to interpret the policy output (default: {DEFAULT_ACTION_MODE}). "
                         f"MUST match the converter's ACTION_MODE — mismatch produces wildly wrong targets.")
     p.add_argument("--action-delta-scale", type=float, default=DEFAULT_ACTION_DELTA_SCALE,
-                   help=f"Inverse scale for relative-mode actions (default: {DEFAULT_ACTION_DELTA_SCALE}). "
+                   help=f"Joint-delta multiplier used by the converter (default: {DEFAULT_ACTION_DELTA_SCALE}). "
+                        f"Inference divides action[:6] by this to recover real deltas. "
                         f"Ignored in absolute mode. Must match the converter's ACTION_DELTA_SCALE.")
+    p.add_argument("--gripper-scale", type=float, default=DEFAULT_GRIPPER_SCALE,
+                   help=f"Gripper-amplitude multiplier used by the converter (default: {DEFAULT_GRIPPER_SCALE}). "
+                        f"Inference divides action[6] by this to recover the 0-100 amplitude. "
+                        f"Ignored in absolute mode. Must match the converter's GRIPPER_SCALE.")
     p.add_argument("--dry-run", action="store_true",
                    help="Predict one action and print it, but do NOT send to the robot.")
     p.add_argument("-v", "--verbose", action="store_true",
@@ -232,9 +244,12 @@ def parse_args():
     return p.parse_args()
 
 
-def print_dry_run(cur_state, action_np, target_joints, gripper_amp, action_mode, action_delta_scale):
+def print_dry_run(cur_state, action_np, target_joints, gripper_amp, action_mode, action_delta_scale, gripper_scale):
     print("\n=== Dry-run prediction ===")
-    print(f"  action_mode={action_mode}  scale={action_delta_scale if action_mode == 'relative' else 'n/a'}")
+    if action_mode == "relative":
+        print(f"  action_mode=relative  joint_scale={action_delta_scale}  gripper_scale={gripper_scale}")
+    else:
+        print(f"  action_mode=absolute  scales=n/a")
     print(f"  current state : {np.round(cur_state[:6], 3)}    "
           f"gripper={cur_state[6]:5.1f}" if len(cur_state) >= 7
           else f"  current state : {np.round(cur_state[:6], 3)}")
@@ -258,8 +273,11 @@ def main():
     # 1. Load policy
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Loading {args.checkpoint}  (device: {device})")
-    print(f"  action_mode={args.action_mode}  "
-          f"scale={args.action_delta_scale if args.action_mode == 'relative' else 'n/a'}")
+    if args.action_mode == "relative":
+        print(f"  action_mode=relative  joint_scale={args.action_delta_scale}  "
+              f"gripper_scale={args.gripper_scale}")
+    else:
+        print(f"  action_mode=absolute  scales=n/a")
     policy = DiffusionPolicy.from_pretrained(args.checkpoint)
     policy.to(device).eval()
     print(f"  horizon={policy.config.horizon}  "
@@ -296,10 +314,10 @@ def main():
         action_np = action[0].cpu().numpy()
         cur_state = obs["observation.state"][0].cpu().numpy()
         target_joints, gripper_amp = resolve_targets(
-            cur_state, action_np, args.action_mode, args.action_delta_scale
+            cur_state, action_np, args.action_mode, args.action_delta_scale, args.gripper_scale
         )
         print_dry_run(cur_state, action_np, target_joints, gripper_amp,
-                      args.action_mode, args.action_delta_scale)
+                      args.action_mode, args.action_delta_scale, args.gripper_scale)
 
         if args.dry_run:
             print("\n--dry-run set, exiting without moving the robot.")
@@ -351,7 +369,7 @@ def main():
             state_np = obs["observation.state"][0].cpu().numpy()
 
             target_joints, gripper_amp = resolve_targets(
-                state_np, action_np, args.action_mode, args.action_delta_scale
+                state_np, action_np, args.action_mode, args.action_delta_scale, args.gripper_scale
             )
             gripper_sent = send_targets(target_joints, gripper_amp, lebai)
 

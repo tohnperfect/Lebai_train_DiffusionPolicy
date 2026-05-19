@@ -77,30 +77,37 @@ CSV columns include: `frame, color, wrist, jp0..jp5, tgt_jp0..tgt_jp5, claw_ampl
 
 The converter supports two modes via `ACTION_MODE`:
 
-- **`"relative"` (default)** — `action[:6] = (next_jp - jp) * ACTION_DELTA_SCALE`. Per-tick joint deltas in rad, multiplied by a constant (default `100.0`). Raw deltas at 10 Hz are ~`0.005–0.01` rad — too small for the network to fit quickly. Scaling brings target magnitudes to ~`0.5–1.0`, which trains much faster.
-- **`"absolute"`** — `action[:6] = tgt_jp[:6]`, with fallback to `next_row.jp*` if the firmware didn't populate `tgt_jp*`. Old convention from the ACT repo. Kept for compatibility.
+- **`"relative"` (default)** — joint deltas and gripper amplitude are each multiplied by a scaling constant before being saved:
+  - `action[:6] = (next_jp - jp) * ACTION_DELTA_SCALE` (default `100.0`). Raw joint deltas at 10 Hz are ~`0.005–0.01` rad — too small for the network to fit quickly. Scaling brings target magnitudes to ~`0.5–1.0`.
+  - `action[6]  = next_claw_amplitude * GRIPPER_SCALE` (default `0.01`). Raw gripper amplitudes are in `[0, 100]` with mean ~80 — two orders of magnitude larger than the scaled joint deltas. DP's per-dim normalization can miscalibrate when one dim's distribution is that different from the others, and in practice the policy collapses to predicting near-zero gripper amplitudes at inference (we hit this; see §14). Multiplying by `0.01` puts the gripper in `[0, 1]` with std ~0.28 — same order as the scaled joint deltas.
+- **`"absolute"`** — `action[:6] = tgt_jp[:6]`, with fallback to `next_row.jp*` if the firmware didn't populate `tgt_jp*`. Old convention from the ACT repo. Kept for compatibility. Gripper stays at the unscaled `next_claw_amplitude` in `[0, 100]`. No `GRIPPER_SCALE` is applied.
 
-In both modes:
-- **`action[6] = next_row.claw_amplitude`** — gripper is **always** the absolute next-frame amplitude in `[0, 100]`, **never scaled**. The next-frame trick compensates for the gripper's slow actuator (command issued at `t` shows up in the actual amplitude around `t+1`).
+In both modes the gripper amplitude is pulled from `next_row`, not the current row — the **next-frame gripper trick** compensates for the gripper's slow actuator (the command issued at `t` shows up in the actual amplitude around `t+1`).
 
-The scale is encoded in `REPO_ID` so different action representations can coexist on disk and so inference can refuse to run with a mismatched scale:
+Both scales are encoded in `REPO_ID` so different action representations can coexist on disk and so inference can refuse to run with a mismatched scale. The numeric suffix is the *divisor* needed at inference time (i.e. `1 / GRIPPER_SCALE`, the more readable inverse):
 
 ```python
 if ACTION_MODE == "relative":
-    REPO_ID = f"local/lebai_duck_pick_delta_x{int(ACTION_DELTA_SCALE)}"
+    if GRIPPER_SCALE == 1.0 or not INCLUDE_GRIPPER:
+        REPO_ID = f"local/lebai_duck_pick_delta_x{int(ACTION_DELTA_SCALE)}"
+    else:
+        REPO_ID = (f"local/lebai_duck_pick_delta_x{int(ACTION_DELTA_SCALE)}"
+                   f"_g{int(round(1.0 / GRIPPER_SCALE))}")
 else:
     REPO_ID = "local/lebai_duck_pick"
 ```
 
-All four stages (`convert_local.py`, `verify_local.py`, `train_local_gpu.py`, `run_inference.py`) and the Colab notebook must agree on `ACTION_MODE` and `ACTION_DELTA_SCALE`. `run_inference.py` has `--action-mode` and `--action-delta-scale` flags that default to relative / 100.
+All four stages (`convert_local.py`, `verify_local.py`, `train_local_gpu.py`, `run_inference.py`) and the Colab notebook must agree on `ACTION_MODE`, `ACTION_DELTA_SCALE`, and `GRIPPER_SCALE`. `run_inference.py` has `--action-mode`, `--action-delta-scale`, and `--gripper-scale` flags that default to relative / 100 / 0.01.
 
 Inference resolution (`run_inference.py:resolve_targets`):
 
 ```python
 if action_mode == "relative":
     target_joints[i] = state[i] + action[i] / action_delta_scale
+    gripper_amp      = clip(action[6] / gripper_scale, 0, 100)
 else:
     target_joints[i] = action[i]
+    gripper_amp      = clip(action[6], 0, 100)
 ```
 
 `INCLUDE_GRIPPER = False` in the converter drops the 7th dim → both state and action become `(6,)`. All stages must agree.
@@ -334,8 +341,8 @@ The dataset reaches the GPU box via `rsync` (resumable, incremental, no 14 GB ta
 
 ```bash
 rsync -avh --progress \
-    ./result/local/lebai_duck_pick_delta_x100/ \
-    user@gpu:Lebai_train_DiffusionPolicy/result/local/lebai_duck_pick_delta_x100/
+    ./result/local/lebai_duck_pick_delta_x100_g100/ \
+    user@gpu:Lebai_train_DiffusionPolicy/result/local/lebai_duck_pick_delta_x100_g100/
 ```
 
 Resume from the latest `step_*` checkpoint is automatic. Fast-forward the LR scheduler from `start_step`.
@@ -426,7 +433,7 @@ Headline: **"Recommended: convert locally, rsync to a GPU box, train there, scp 
 Include:
 
 1. Local convert: `python convert_local.py` then `python verify_local.py`.
-2. `rsync -avh --progress ./result/local/lebai_duck_pick_delta_x100/ user@gpu:.../result/local/lebai_duck_pick_delta_x100/`.
+2. `rsync -avh --progress ./result/local/lebai_duck_pick_delta_x100_g100/ user@gpu:.../result/local/lebai_duck_pick_delta_x100_g100/`.
 3. On the GPU box: `./setup_gpu_env.sh`, `python train_local_gpu.py --smoke-test` (mandatory), then `python train_local_gpu.py`.
 4. `scp -r user@gpu:.../checkpoints/dp_run01/final ./checkpoints/dp_run01/final` on the robot machine.
 5. Local inference: `python run_inference.py --dry-run`, then `SAFETY_OK=1 python run_inference.py --duration 30`.
@@ -469,7 +476,7 @@ CLAUDE.md
 4. **Don't pass dataset features directly to `cfg.input_features` / `cfg.output_features`.** They need `PolicyFeature` wrappers in lerobot ≥0.5. For DP, VISUAL shapes must be CHW, not HWC (see §7.6).
 5. **Don't expect `episode_data_index` on the dataset.** Use `ds.meta.episodes[i]["dataset_from_index"]`.
 6. **Don't unpack `policy.forward(batch)` as a dict.** It returns `(loss, loss_dict)` tuple in lerobot ≥0.5. For DP the second element is always `None` — `loss, _ = policy.forward(batch)`.
-7. **Don't use raw per-tick joint deltas at 10 Hz as the action target.** Magnitudes are ~`±0.005-0.01` rad — too small to train quickly. Multiply by `ACTION_DELTA_SCALE = 100.0` (see §5) and encode the scale in `REPO_ID`. Inference must divide by the same constant.
+7. **Don't use raw per-tick joint deltas at 10 Hz as the action target.** Magnitudes are ~`±0.005-0.01` rad — too small to train quickly. Multiply by `ACTION_DELTA_SCALE = 100.0` (see §5) and encode the scale in `REPO_ID`. Inference must divide by the same constant. **Same applies to the gripper**: an unscaled gripper in `[0, 100]` while joint actions are in `~[-1, 1]` causes the policy to collapse to predicting near-zero gripper at inference (we hit this — pred std ~0.7 vs gt std ~28, mean abs error ~85 on a [0, 100] scale). Apply `GRIPPER_SCALE = 0.01` so it lands in `[0, 1]` and encode that in `REPO_ID` too (`_g100` suffix).
 8. **Don't use `image_writer_threads=4, image_writer_processes=2`** (the lerobot defaults). On 8 GB M1 the writer queue OOMs and you get random `FileNotFoundError: ... frame-NNN.png` mid-conversion when `save_episode` tries to read images back. Use `threads=2, processes=0`. **Don't go all the way to `threads=0, processes=0`** — that disables image writing entirely in lerobot 0.5.1 (only the first episode's directory is created, rest silently dropped).
 9. **Don't only drain the image writer at episode boundaries.** The queue can still grow within a long episode. Drain every ~200 frames inside the per-frame loop, and drain once more before each `save_episode()`:
    ```python
@@ -513,11 +520,11 @@ These come from `grasp_to_the_bowl.py` (Lebai's reference scripted-control examp
 
 The repo is done when:
 
-- [ ] `python convert_local.py` produces `result/local/lebai_duck_pick_delta_x100/` containing data + meta parquets. Episode/frame counts match what's in `Data/` (e.g. 30 episodes / 27,503 frames for the bundled 30 logs).
+- [ ] `python convert_local.py` produces `result/local/lebai_duck_pick_delta_x100_g100/` containing data + meta parquets. Episode/frame counts match what's in `Data/` (e.g. 30 episodes / 27,503 frames for the bundled 30 logs).
 - [ ] **Spot-check action magnitudes.** `ds[600]["action"][:6]` shows values with `|max|` around `0.5–1.0` (not `~0.05`). Confirms `ACTION_DELTA_SCALE` is applied. `verify_local.py` prints this automatically.
 - [ ] `python verify_local.py` opens the dataset cleanly in a fresh process.
 - [ ] **Idempotent re-convert.** Running `python convert_local.py` twice in a row succeeds; the second run cleanly wipes the existing dataset and rebuilds without `OSError: Directory not empty` (image-writer cleanup is working).
-- [ ] `rsync -avh --progress ./result/local/lebai_duck_pick_delta_x100/ user@gpu:.../result/local/lebai_duck_pick_delta_x100/` transfers cleanly and is resumable.
+- [ ] `rsync -avh --progress ./result/local/lebai_duck_pick_delta_x100_g100/ user@gpu:.../result/local/lebai_duck_pick_delta_x100_g100/` transfers cleanly and is resumable.
 - [ ] `./setup_gpu_env.sh` on the GPU box creates `.venv/` and installs `lerobot==0.5.1`.
 - [ ] `python train_local_gpu.py --smoke-test` completes 200 steps with mean loss in the last 10 steps lower than mean loss in the first 10 steps.
 - [ ] `python train_local_gpu.py` runs end-to-end (full default 100k steps), resuming from `step_*` if interrupted, saving `final/` at the end.

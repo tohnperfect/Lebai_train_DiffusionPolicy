@@ -23,8 +23,14 @@ RESULT_ROOT = REPO_ROOT / "result"
 # Must match convert_local.py — keep these in sync if you change the action mode.
 ACTION_MODE = "relative"
 ACTION_DELTA_SCALE = 100.0
+GRIPPER_SCALE = 0.01
+INCLUDE_GRIPPER = True
 if ACTION_MODE == "relative":
-    REPO_ID = f"local/lebai_duck_pick_delta_x{int(ACTION_DELTA_SCALE)}"
+    if not INCLUDE_GRIPPER or GRIPPER_SCALE == 1.0:
+        REPO_ID = f"local/lebai_duck_pick_delta_x{int(ACTION_DELTA_SCALE)}"
+    else:
+        REPO_ID = (f"local/lebai_duck_pick_delta_x{int(ACTION_DELTA_SCALE)}"
+                   f"_g{int(round(1.0 / GRIPPER_SCALE))}")
 else:
     REPO_ID = "local/lebai_duck_pick"
 
@@ -55,25 +61,38 @@ def main():
     print(f"  action: shape={action.shape}  values={action.round(3).tolist()}")
     print(f"  image:  shape={tuple(img.shape)}  dtype={img.dtype}")
 
-    # Spot-check action magnitudes (PRD §16): in relative mode with x100 scale
-    # the per-tick joint deltas should land in ~[-2, 2] with typical |a| ~ 0.5-1.0.
-    # Smaller than that (e.g. ~0.005) means the scale was not applied.
+    # Spot-check action magnitudes (PRD §16). In relative mode with x100 joint
+    # scale, per-tick joint deltas land in ~[-2, 2] with typical |a| ~ 0.5-1.0.
+    # With GRIPPER_SCALE=0.01, the gripper (dim 6) sits in [0, 1] (mean ~0.8).
     if ds.num_frames > 600:
         idx = 600
         a = ds[idx]["action"].numpy()
-        max_abs = float(np.abs(a[:6]).max())
+        joints = a[:6]
+        max_abs_joint = float(np.abs(joints).max())
         print()
-        print(f"Spot-check ds[{idx}]['action'][:6]:")
-        print(f"  values  = {a[:6].round(4).tolist()}")
-        print(f"  max|.|  = {max_abs:.4f}")
+        print(f"Spot-check ds[{idx}]['action']:")
+        print(f"  joints = {joints.round(4).tolist()}    |max|={max_abs_joint:.4f}")
         if ACTION_MODE == "relative":
-            if max_abs < 0.05:
-                print("  WARNING: magnitudes look too small for a scaled delta — "
+            if max_abs_joint < 0.05:
+                print("  WARNING: joint magnitudes look too small for a scaled delta — "
                       f"is ACTION_DELTA_SCALE={ACTION_DELTA_SCALE} actually applied?")
-            elif max_abs > 5.0:
-                print(f"  WARNING: magnitudes look too large — sanity-check ACTION_DELTA_SCALE.")
+            elif max_abs_joint > 5.0:
+                print("  WARNING: joint magnitudes look too large — sanity-check ACTION_DELTA_SCALE.")
             else:
-                print("  Scaling looks reasonable.")
+                print("  Joint scaling looks reasonable.")
+
+        if a.shape[0] >= 7:
+            grip = float(a[6])
+            print(f"  gripper = {grip:.4f}")
+            if ACTION_MODE == "relative":
+                expected_max = 100.0 * GRIPPER_SCALE * 1.05
+                if abs(grip) > expected_max:
+                    print(f"  WARNING: gripper {grip:.3f} exceeds expected scaled range "
+                          f"[-{expected_max:.2f}, {expected_max:.2f}] — is GRIPPER_SCALE={GRIPPER_SCALE} actually applied?")
+                elif 0.0 <= grip <= 1.05:
+                    print(f"  Gripper scaling looks reasonable (scaled to ~[0, 1]).")
+                else:
+                    print(f"  WARNING: gripper magnitude looks off — check GRIPPER_SCALE={GRIPPER_SCALE}.")
 
     print()
     print("Dataset OK.")
